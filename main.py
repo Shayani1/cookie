@@ -1,33 +1,22 @@
-# qx_cookie_refresher.py – updated with automatic Playwright browser install
-"""
-FastAPI micro‑service that logs into https://market-qx.pro/ via headless
-Chromium (Playwright). It refreshes session cookies every REFRESH_MINS
-(default 30) and exposes them at /get-cookies for Bubble/Create.
-Now includes an automatic `playwright install --with-deps` step on startup
-so Railway / Nixpacks deployments work without manual commands.
-Environment variables required:
-  QX_EMAIL      – Quotex login email
-  QX_PASSWORD   – Quotex password
-  REFRESH_MINS  – optional refresh interval (integer, default 30)
-"""
+# main.py – Quotex Cookie Refresher with Logging & Screenshot
 from __future__ import annotations
 import os, json, time, subprocess, sys
 from datetime import datetime, timedelta
 from threading import Thread
-from typing import Dict, Any, List
+from typing import Dict, Any
 
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 
-# --- Ensure Playwright Browsers Installed ----------------------------------
-# This runs only once at startup; safe in Railway read‑only FS.
+# --- Ensure Playwright Browsers Installed Automatically --------------------
 try:
     subprocess.run([sys.executable, "-m", "playwright", "install", "--with-deps"], check=True)
 except Exception as e:
     print("[Playwright] install failed or already done:", e)
 
-from playwright.sync_api import sync_playwright, TimeoutError as PwTimeout  # noqa: E402
+from playwright.sync_api import sync_playwright, TimeoutError as PwTimeout
 
+# --- ENV Setup -------------------------------------------------------------
 EMAIL       = os.getenv("QX_EMAIL")
 PASSWORD    = os.getenv("QX_PASSWORD")
 REFRESH_MIN = int(os.getenv("REFRESH_MINS", "30"))
@@ -35,25 +24,31 @@ REFRESH_MIN = int(os.getenv("REFRESH_MINS", "30"))
 if not EMAIL or not PASSWORD:
     raise RuntimeError("QX_EMAIL and QX_PASSWORD environment variables are required")
 
+# --- Session Store ---------------------------------------------------------
 cookie_store: Dict[str, Any] = {
     "cookies": [],
     "headers": {},
     "expires_at": datetime.utcnow(),
 }
 
-# ---------------------------------------------------------------------------
-# Playwright login & extraction
-# ---------------------------------------------------------------------------
+# --- Logging Helper --------------------------------------------------------
+def log(message: str):
+    timestamp = datetime.utcnow().isoformat()
+    entry = f"[{timestamp} UTC] {message}"
+    print(entry)
+    with open("cookie_log.txt", "a") as f:
+        f.write(entry + "\n")
 
+# --- Login + Extract Cookies -----------------------------------------------
 def login_and_extract() -> None:
     """Headless login to Quotex, refresh global cookie_store."""
     global cookie_store
+    log("Attempting login and cookie refresh...")
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         page = browser.new_page()
         try:
             page.goto("https://market-qx.pro/", timeout=60000)
-            # Click login button if present
             if page.locator('text="Log in"').count():
                 page.locator('text="Log in"').first.click()
             page.fill('input[type="email"]', EMAIL)
@@ -74,18 +69,21 @@ def login_and_extract() -> None:
                 "headers": headers,
                 "expires_at": datetime.utcnow() + timedelta(minutes=REFRESH_MIN),
             }
-            print(f"[CookieRefresher] Refreshed at {datetime.utcnow().isoformat()} UTC")
+
+            log("✅ Cookie refresh complete.")
         except PwTimeout:
-            print("[CookieRefresher] Timeout during login; cookies not updated")
+            log("⚠️ Timeout during login. Capturing screenshot...")
+            page.screenshot(path="login_error.png")
         except Exception as e:
-            print(f"[CookieRefresher] Unexpected error: {e}")
+            log(f"❌ Unexpected error: {e}")
+            try:
+                page.screenshot(path="login_error.png")
+            except Exception:
+                log("⚠️ Screenshot failed.")
         finally:
             browser.close()
 
-# ---------------------------------------------------------------------------
-# Background refresher thread
-# ---------------------------------------------------------------------------
-
+# --- Background Thread for Refreshing -------------------------------------
 def refresher_loop():
     while True:
         login_and_extract()
@@ -93,17 +91,15 @@ def refresher_loop():
 
 Thread(target=refresher_loop, daemon=True).start()
 
-# ---------------------------------------------------------------------------
-# FastAPI app
-# ---------------------------------------------------------------------------
-app = FastAPI(title="Quotex Cookie Refresher", version="1.1.0")
+# --- FastAPI App Setup -----------------------------------------------------
+app = FastAPI(title="Quotex Cookie Refresher", version="1.2.0")
 
 @app.get("/get-cookies", tags=["session"])
 def get_cookies():
     """Return latest cookies + headers bundle."""
     return JSONResponse(cookie_store)
 
-# ---------------------------------------------------------------------------
+# --- Run Local Dev ---------------------------------------------------------
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("qx_cookie_refresher:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
+    uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
